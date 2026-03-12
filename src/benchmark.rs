@@ -22,6 +22,7 @@ struct BenchmarkStats {
     successful_requests: usize,
     failed_requests: usize,
     total_latency: Duration,
+    elapsed: Duration,
 }
 
 impl BenchmarkStats {
@@ -31,9 +32,16 @@ impl BenchmarkStats {
             successful_requests: 0,
             failed_requests: 0,
             total_latency: Duration::ZERO,
+            elapsed: Duration::ZERO,
         }
     }
 }
+
+/// Number of concurrent clients to simulate
+const CONCURRENT_CLIENTS: usize = 10;
+
+/// Number of requests each client will send
+const REQUESTS_PER_CLIENT: usize = 10000;
 
 struct BenchmarkConfig {
     name: String,
@@ -115,6 +123,7 @@ async fn run_benchmark(config: BenchmarkConfig) -> BenchmarkStats {
         successful_requests: final_stats.successful_requests,
         failed_requests: final_stats.failed_requests,
         total_latency: final_stats.total_latency,
+        elapsed,
     }
 }
 
@@ -143,7 +152,7 @@ async fn benchmark_client(
         }
     };
 
-    println!("   Client {} initialized session", client_id);
+    //println!("   Client {} initialized session", client_id);
 
     // Step 2: Reuse session for all tool calls
     for i in 0..num_requests {
@@ -184,8 +193,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   Method: Initialize once, call get_system_time repeatedly");
 
     // Benchmark configuration
-    let concurrent_clients = 10;
-    let requests_per_client = 100;
+    let concurrent_clients = CONCURRENT_CLIENTS;
+    let requests_per_client = REQUESTS_PER_CLIENT;
 
     // Test 1: Direct connection
     let direct_stats = run_benchmark(BenchmarkConfig {
@@ -227,15 +236,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let overhead = gateway_latency / direct_latency;
 
+    let direct_throughput = direct_stats.successful_requests as f64 / direct_stats.elapsed.as_secs_f64();
+    let gateway_throughput = gateway_stats.successful_requests as f64 / gateway_stats.elapsed.as_secs_f64();
+
     println!(
         "Direct:  {:.2} req/s (avg {:.2}ms, {}% success)",
-        direct_stats.successful_requests as f64 / 2.0,  // Approximate based on elapsed
+        direct_throughput,
         direct_latency * 1000.0,
         direct_stats.successful_requests * 100 / direct_stats.total_requests.max(1)
     );
     println!(
         "Gateway: {:.2} req/s (avg {:.2}ms, {}% success)",
-        gateway_stats.successful_requests as f64 / 2.0,  // Approximate based on elapsed
+        gateway_throughput,
         gateway_latency * 1000.0,
         gateway_stats.successful_requests * 100 / gateway_stats.total_requests.max(1)
     );

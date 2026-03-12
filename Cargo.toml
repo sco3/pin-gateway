@@ -7,9 +7,6 @@ edition = "2021"
 name = "gateway"
 path = "src/main.rs"
 
-[[bin]]
-name = "mcp-client"
-path = "src/client.rs"
 
 [[bin]]
 name = "benchmark"
@@ -31,3 +28,27 @@ tokio-stream = "0.1"
 
 # Benchmark dependencies
 rmcp = { version = "1.2.0", features = ["client", "transport-streamable-http-client-reqwest"] }
+
+# Performance optimizations
+once_cell = "1.21"
+regex = "1.11"
+rustc-hash = "2.1"
+http = "1.3"
+
+[profile.release]
+# Maximum optimization level
+opt-level = 3
+# Fat LTO for whole-program optimization
+lto = "fat"
+# Single codegen unit for better optimization across crate boundaries
+codegen-units = 1
+# Abort on panic to reduce binary size and improve performance
+panic = "abort"
+# Strip debug symbols to reduce binary size
+strip = true
+
+# Profile for benchmarking with debug symbols (for perf/flamegraph)
+[profile.bench]
+inherits = "release"
+strip = false
+debug = true
