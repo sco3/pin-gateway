@@ -66,16 +66,18 @@ impl ProxyHttp for DynamicMcpGateway {
         } else if slug == "message" || slug == "http" {
             // For message endpoint (SSE) or http endpoint (Streamable HTTP), 
             // look up the session to find the server
-            let headers = session.req_header().headers;
+            let req_headers = session.req_header();
             
             // Try to get session ID from Mcp-Session-Id header (Streamable HTTP)
-            let session_id = if let Some(sid) = headers.get("Mcp-Session-Id") {
-                sid.to_str().ok().map(|s| s.to_string())
-            } else {
-                // Fall back to query parameter (SSE)
-                let query = session.req_header().uri.query().unwrap_or("");
-                query.split('=').nth(1).map(|s| s.to_string())
-            };
+            let session_id = req_headers.headers.get("Mcp-Session-Id")
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    // Fall back to query parameter (SSE)
+                    req_headers.uri.query()
+                        .and_then(|q| q.split('=').nth(1))
+                        .map(|s| s.to_string())
+                });
             
             if let Some(session_id) = session_id {
                 let sessions = self.sessions.read().await;
@@ -157,7 +159,11 @@ impl ProxyHttp for DynamicMcpGateway {
         if let Some(cache) = headers.headers.get("Cache-Control") {
             let _ = upstream_request.insert_header("Cache-Control", cache.clone());
         }
-        
+        // Preserve Mcp-Session-Id header for Streamable HTTP
+        if let Some(session_id) = headers.headers.get("Mcp-Session-Id") {
+            let _ = upstream_request.insert_header("Mcp-Session-Id", session_id.clone());
+        }
+
         println!("   → Forwarding to upstream with path: {}", upstream_request.uri.path());
 
         Ok(())
@@ -167,16 +173,31 @@ impl ProxyHttp for DynamicMcpGateway {
         &self,
         session: &mut Session,
         response: &mut ResponseHeader,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> Result<()> {
         // Add CORS headers for web-based tools like MCP Inspector
         let _ = response.insert_header("Access-Control-Allow-Origin", "*");
         let _ = response.insert_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
         let _ = response.insert_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-        
+
         let status = response.status;
         let path = session.req_header().uri.path();
         println!("✅ Response {} for {}", status, path);
+        
+        // Capture Mcp-Session-Id header for Streamable HTTP
+        if let Some(session_id_header) = response.headers.get("Mcp-Session-Id") {
+            if let Ok(session_id) = session_id_header.to_str() {
+                let session_id = session_id.to_string();
+                println!("💾 Storing Streamable HTTP session: {} -> {}", session_id, ctx.server_name);
+                let sessions = self.sessions.clone();
+                let server_name = ctx.server_name.clone();
+                tokio::spawn(async move {
+                    let mut s = sessions.write().await;
+                    s.insert(session_id, server_name);
+                    println!("💾 Streamable HTTP session stored in map");
+                });
+            }
+        }
 
         Ok(())
     }
