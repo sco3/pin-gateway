@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+   "time": {
+      "url": "http://localhost:8111/http"
+    }
+  }
+}
