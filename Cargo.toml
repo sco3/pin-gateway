@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "mcp-client"
 path = "src/client.rs"
 
+[[bin]]
+name = "benchmark"
+path = "src/benchmark.rs"
+
 [dependencies]
 arc-swap = "1.7"
 async-trait = "0.1.89"
@@ -24,3 +28,6 @@ tokio = { version = "1.50.0", features = ["full"] }
 # MCP client dependencies - rust-mcp-sdk for SSE transport support
 rust-mcp-sdk = { version = "0.8", features = ["client", "sse"] }
 tokio-stream = "0.1"
+
+# Benchmark dependencies
+rmcp = { version = "1.2.0", features = ["client", "transport-streamable-http-client-reqwest"] }
