@@ -3,6 +3,8 @@ use async_trait::async_trait;
 use pingora::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::collections::HashMap;
+use tokio::sync::RwLock;
 
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -21,17 +23,20 @@ struct McpConfig {
 pub struct McpCtx {
     should_strip: bool,
     use_tls: bool,
+    server_name: String,
 }
 
 pub struct DynamicMcpGateway {
     conf: Arc<ArcSwap<McpConfig>>,
+    // Map sessionId -> server_name for routing message endpoints
+    sessions: Arc<RwLock<HashMap<String, String>>>,
 }
 
 #[async_trait]
 impl ProxyHttp for DynamicMcpGateway {
     type CTX = McpCtx;
     fn new_ctx(&self) -> Self::CTX {
-        McpCtx { should_strip: false, use_tls: false }
+        McpCtx { should_strip: false, use_tls: false, server_name: String::new() }
     }
 
     async fn upstream_peer<'a>(
@@ -50,13 +55,47 @@ impl ProxyHttp for DynamicMcpGateway {
             // Write the "sticky note" for the next step
             ctx.should_strip = server.strip_slug;
             ctx.use_tls = server.use_tls;
+            ctx.server_name = server.name.clone();
 
             // Set Host header to the upstream server address
             let host = server.url.clone();
-            
+
             println!("🔌 Routing {} {} -> {}", method, path, server.url);
 
             Ok(Box::new(HttpPeer::new(&server.url, server.use_tls, host)))
+        } else if slug == "message" || slug == "http" {
+            // For message endpoint (SSE) or http endpoint (Streamable HTTP), 
+            // look up the session to find the server
+            let headers = session.req_header().headers;
+            
+            // Try to get session ID from Mcp-Session-Id header (Streamable HTTP)
+            let session_id = if let Some(sid) = headers.get("Mcp-Session-Id") {
+                sid.to_str().ok().map(|s| s.to_string())
+            } else {
+                // Fall back to query parameter (SSE)
+                let query = session.req_header().uri.query().unwrap_or("");
+                query.split('=').nth(1).map(|s| s.to_string())
+            };
+            
+            if let Some(session_id) = session_id {
+                let sessions = self.sessions.read().await;
+                if let Some(server_name) = sessions.get(&session_id) {
+                    let server_name = server_name.clone();
+                    drop(sessions);
+                    if let Some(server) = current_conf.servers.iter().find(|s| s.name == server_name) {
+                        ctx.should_strip = false;
+                        ctx.use_tls = server.use_tls;
+                        ctx.server_name = server.name.clone();
+
+                        let host = server.url.clone();
+                        println!("🔌 Routing {} {} -> {} (session: {})", method, path, server.url, session_id);
+
+                        return Ok(Box::new(HttpPeer::new(&server.url, server.use_tls, host)));
+                    }
+                }
+            }
+            println!("❌ Session not found for: {}", slug);
+            Err(Error::explain(Custom("404"), "Session not found"))
         } else {
             println!("❌ Server not found: {} (from path: {})", slug, path);
             Err(Error::explain(Custom("404"), "Server not found"))
@@ -85,6 +124,14 @@ impl ProxyHttp for DynamicMcpGateway {
         if session.req_header().method == "OPTIONS" {
             println!("   ⚡ CORS preflight - skipping upstream");
             return Ok(());
+        }
+
+        // For SSE GET requests, store a session mapping for later message requests
+        if method == "GET" && !ctx.server_name.is_empty() {
+            let sessions = self.sessions.clone();
+            let server_name = ctx.server_name.clone();
+            // We'll store the session when we see the response with sessionId
+            println!("   📡 SSE request for server: {}", server_name);
         }
 
         // Only strip if the config told us to!
@@ -147,22 +194,36 @@ impl ProxyHttp for DynamicMcpGateway {
     fn response_body_filter(
         &self,
         _session: &mut Session,
-        _body: &mut Option<bytes::Bytes>,
+        body: &mut Option<bytes::Bytes>,
         _end_of_stream: bool,
         _ctx: &mut Self::CTX,
     ) -> Result<Option<std::time::Duration>> {
+        // Capture sessionId from SSE endpoint response
+        println!("🔍 response_body_filter: body={:?}, server_name={}", body.is_some(), _ctx.server_name);
+        if let Some(body_bytes) = body {
+            let body_str = String::from_utf8_lossy(body_bytes);
+            println!("🔍 Body content: {}", body_str);
+            if body_str.contains("sessionId=") {
+                // Extract sessionId from "data: /message?sessionId=xxx"
+                for line in body_str.lines() {
+                    if line.starts_with("data:") && line.contains("sessionId=") {
+                        if let Some(session_id) = line.split("sessionId=").nth(1) {
+                            let session_id = session_id.trim().to_string();
+                            println!("💾 Storing session: {} -> {}", session_id, _ctx.server_name);
+                            // Store in a blocking way (we're in a sync function)
+                            let sessions = self.sessions.clone();
+                            let server_name = _ctx.server_name.clone();
+                            tokio::spawn(async move {
+                                let mut s = sessions.write().await;
+                                s.insert(session_id, server_name);
+                                println!("💾 Session stored in map");
+                            });
+                        }
+                    }
+                }
+            }
+        }
         Ok(None)
-    }
-
-    async fn logging_filter(
-        &self,
-        session: &mut Session,
-        e: &Error,
-        _ctx: &mut Self::CTX,
-    ) {
-        let path = session.req_header().uri.path();
-        let method = &session.req_header().method;
-        println!("❌ ERROR: {} {} - {:?}", method, path, e);
     }
 }
 fn main() {
@@ -170,6 +231,7 @@ fn main() {
     let raw_conf = std::fs::read_to_string("mcp_servers.yaml").expect("Missing config file");
     let config: McpConfig = serde_yaml::from_str(&raw_conf).unwrap();
     let shared_conf = Arc::new(ArcSwap::from_pointee(config));
+    let sessions = Arc::new(RwLock::new(HashMap::new()));
 
     // 2. Setup File Watcher (Simplified)
     let conf_for_watcher = shared_conf.clone();
@@ -189,10 +251,10 @@ fn main() {
 
     let mut server = Server::new(None).unwrap();
     server.bootstrap();
-    
+
     let mut mcp_service = http_proxy_service(
         &server.configuration,
-        DynamicMcpGateway { conf: shared_conf },
+        DynamicMcpGateway { conf: shared_conf, sessions: sessions.clone() },
     );
 
     mcp_service.add_tcp("0.0.0.0:3000");
