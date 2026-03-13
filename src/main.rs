@@ -306,8 +306,8 @@ impl ProxyHttp for DynamicMcpGateway {
 fn main() {
     // Load initial config
     let raw_conf =
-        std::fs::read_to_string("mcp_servers.yaml").expect("Missing config file");
-    let config: McpConfig = serde_yaml::from_str(&raw_conf).unwrap();
+        std::fs::read_to_string("mcp-servers.toml").expect("Missing config file");
+    let config: McpConfig = toml::from_str(&raw_conf).unwrap();
     let shared_conf = Arc::new(ArcSwap::from_pointee(config));
     let sessions = Arc::new(RwLock::new(rustc_hash::FxHashMap::default()));
 
@@ -316,8 +316,8 @@ fn main() {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(Duration::from_secs(5));
-            if let Ok(updated_raw) = std::fs::read_to_string("mcp_servers.yaml") {
-                if let Ok(new_config) = serde_yaml::from_str::<McpConfig>(&updated_raw) {
+            if let Ok(updated_raw) = std::fs::read_to_string("mcp-servers.toml") {
+                if let Ok(new_config) = toml::from_str::<McpConfig>(&updated_raw) {
                     conf_for_watcher.store(Arc::new(new_config));
                 }
             }

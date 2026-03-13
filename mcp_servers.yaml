@@ -1,9 +1,0 @@
-servers:
-  - name: time
-    url: "127.0.0.1:8111"
-    strip_slug: true
-    use_tls: false
-  - name: remote-ai
-    url: "api.inflection.ai:443"
-    strip_slug: true
-    use_tls: true

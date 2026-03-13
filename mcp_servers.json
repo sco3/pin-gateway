@@ -3,8 +3,8 @@
     "time": {
       "url": "http://localhost:8111/http"
     },
-    "ptime": {
-      "url": "http://localhost:8111/time/http"
+    "ssetime": {
+      "url": "http://localhost:8111/sse"
     }
   }
 }
