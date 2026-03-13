@@ -38,6 +38,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
+split-debuginfo = "off"
+debug = true
+
 # Maximum optimization level
 opt-level = 3
 # Fat LTO for whole-program optimization

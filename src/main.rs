@@ -118,10 +118,19 @@ impl DynamicMcpGateway {
         "/".to_string()
     }
 
-    /// Strip /vs/<server_name> prefix from path for MCP servers
-    /// Returns (path, query) tuple to preserve query string
+    /// Fast path manipulation using pre-allocated buffers
+    /// Avoids format! allocations in hot path
     #[inline]
-    fn strip_vs_prefix(path: &str, server_name: &str) -> (String, String) {
+    fn build_uri_fast(new_path: String, query: &str) -> String {
+        let mut result = String::with_capacity(new_path.len() + query.len());
+        result.push_str(&new_path);
+        result.push_str(query);
+        result
+    }
+
+    /// Strip /vs/<server_name> prefix using byte manipulation
+    #[inline]
+    fn strip_vs_prefix<'a>(path: &'a str, server_name: &str) -> (String, &'a str) {
         // Path is like /vs/time/http?sessionId=xxx, we want /http?sessionId=xxx
         // First separate path from query
         let (path_only, query) = if let Some(pos) = path.find('?') {
@@ -130,7 +139,11 @@ impl DynamicMcpGateway {
             (path, "")
         };
         
-        let prefix = format!("/vs/{}", server_name);
+        // Build prefix manually to avoid format!
+        let mut prefix = String::with_capacity(4 + server_name.len());
+        prefix.push_str("/vs/");
+        prefix.push_str(server_name);
+        
         let new_path = if let Some(rest) = path_only.strip_prefix(&prefix) {
             if rest.is_empty() {
                 "/".to_string()
@@ -141,7 +154,7 @@ impl DynamicMcpGateway {
             path_only.to_string()
         };
         
-        (new_path, query.to_string())
+        (new_path, query)
     }
 }
 
@@ -243,7 +256,7 @@ impl ProxyHttp for DynamicMcpGateway {
                 // Strip /vs/<server_name> for MCP servers, preserving query string
                 let server_name_str = Self::get_server_name_str(ctx);
                 let (new_path, query) = Self::strip_vs_prefix(&current_uri, server_name_str);
-                format!("{}{}", new_path, query)
+                Self::build_uri_fast(new_path, query)
             } else {
                 // For non-MCP servers, strip just the first segment
                 // Extract path only (before query)
@@ -257,7 +270,7 @@ impl ProxyHttp for DynamicMcpGateway {
                 } else {
                     path_only.to_string()
                 };
-                format!("{}{}", new_path, query)
+                Self::build_uri_fast(new_path, query)
             };
             upstream_request.set_uri(new_uri.parse().unwrap());
         }
@@ -312,12 +325,13 @@ impl ProxyHttp for DynamicMcpGateway {
         _end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> Result<Option<Duration>> {
-        // Step 1: Fast path - skip body analysis for non-GET requests
-        if session.req_header().method != http::Method::GET || !ctx.is_mcp {
+        // Single method check - fast exit for non-GET requests
+        let method = &session.req_header().method;
+        if method != &http::Method::GET || !ctx.is_mcp {
             return Ok(None);
         }
 
-        // Step 2: Byte scan - check for "data: /" pattern using reference (no clone)
+        // Byte scan - check for "data: /" pattern using reference (no clone)
         let Some(body_bytes) = body else { return Ok(None); };
 
         if !body_bytes.windows(7).any(|w| w == b"data: /") {
@@ -329,10 +343,24 @@ impl ProxyHttp for DynamicMcpGateway {
             Err(_) => return Ok(None),
         };
 
+        // Pre-allocate result buffer to avoid multiple allocations
         let server_name_str = Self::get_server_name_str(ctx);
-        let new_body = body_str.replace("data: /", &format!("data: /vs/{}/", server_name_str));
-        *body = Some(Bytes::from(new_body));
-
+        let prefix_len = 7 + server_name_str.len(); // "data: /" + server_name
+        let mut result = String::with_capacity(body_str.len() + prefix_len);
+        
+        // Manual replacement to avoid format! allocation
+        let mut search_start = 0;
+        while let Some(pos) = body_str[search_start..].find("data: /") {
+            let absolute_pos = search_start + pos;
+            result.push_str(&body_str[..absolute_pos]);
+            result.push_str("data: /vs/");
+            result.push_str(server_name_str);
+            result.push_str("/");
+            search_start = absolute_pos + 7; // len("data: /")
+        }
+        result.push_str(&body_str[search_start..]);
+        
+        *body = Some(Bytes::from(result));
         Ok(None)
     }
 }
