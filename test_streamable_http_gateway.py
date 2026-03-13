@@ -74,10 +74,10 @@ async def main():
     print("   Using: mcp.client.streamable_http.streamable_http_client")
     print("   (SSE transport is deprecated, Streamable HTTP is the new standard)")
 
-    # Test 1: Through gateway
+    # Test 1: Through gateway with /vs/<name> prefix (MCP mode)
     gateway_ok = await test_connection(
-        "Gateway (port 3000)",
-        "http://localhost:3000/time"
+        "Gateway /vs/time (port 3000)",
+        "http://localhost:3000/vs/time"
     )
 
     # Test 2: Direct connection with Streamable HTTP

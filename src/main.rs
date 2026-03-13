@@ -48,6 +48,36 @@ struct McpServerConfig {
     url: String,
     strip_slug: bool,
     use_tls: bool,
+    mcp: bool,
+}
+
+impl McpServerConfig {
+    /// Extract the path slug from the URL (e.g., "127.0.0.1:8111/http" -> "http")
+    fn path_slug(&self) -> &str {
+        if let Some(pos) = self.url.find('/') {
+            self.url[pos + 1..].trim_end_matches('/')
+        } else {
+            ""
+        }
+    }
+
+    /// Extract host:port from URL (e.g., "127.0.0.1:8111/http" -> "127.0.0.1:8111")
+    fn host_port(&self) -> &str {
+        if let Some(pos) = self.url.find('/') {
+            &self.url[..pos]
+        } else {
+            &self.url
+        }
+    }
+
+    /// Extract base path from URL with leading slash (e.g., "127.0.0.1:8111/http" -> "/http")
+    fn base_path(&self) -> &str {
+        if let Some(pos) = self.url.find('/') {
+            &self.url[pos..]
+        } else {
+            "/"
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -63,6 +93,10 @@ pub struct McpCtx {
     server_name: String,
     /// Cached path slice to avoid re-parsing
     path_len: usize,
+    /// Base path from config URL (e.g., "/http")
+    base_path: String,
+    /// Is this an MCP server (requires /vs/<name>/ prefix)
+    is_mcp: bool,
 }
 
 pub struct DynamicMcpGateway {
@@ -98,6 +132,22 @@ impl DynamicMcpGateway {
         }
         // No second slash found, return root
         "/".to_string()
+    }
+
+    /// Strip /vs/<server_name> prefix from path for MCP servers
+    #[inline]
+    fn strip_vs_prefix(path: &str, server_name: &str) -> String {
+        // Path is like /vs/time/http, we want /http
+        let prefix = format!("/vs/{}", server_name);
+        if let Some(rest) = path.strip_prefix(&prefix) {
+            if rest.is_empty() {
+                "/".to_string()
+            } else {
+                rest.to_string()
+            }
+        } else {
+            path.to_string()
+        }
     }
 
     /// Extract session ID from query string without allocation
@@ -137,6 +187,8 @@ impl ProxyHttp for DynamicMcpGateway {
             use_tls: false,
             server_name: String::new(),
             path_len: 0,
+            base_path: String::new(),
+            is_mcp: false,
         }
     }
 
@@ -153,21 +205,47 @@ impl ProxyHttp for DynamicMcpGateway {
         let slug = Self::extract_slug(path);
         let current_conf = self.conf.load();
 
-        // Fast path: direct server match
-        if let Some(server) = current_conf.servers.iter().find(|s| s.name == slug) {
+        // Check for /vs/<server_name>/<path> pattern for MCP servers
+        let path_segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        
+        // Handle /vs/<server_name>/<rest> pattern
+        if path_segments.len() >= 2 && path_segments[0] == "vs" {
+            let server_name = path_segments[1];
+            if let Some(server) = current_conf.servers.iter().find(|s| s.name == server_name && s.mcp) {
+                ctx.should_strip = true; // Strip /vs/<name>
+                ctx.use_tls = server.use_tls;
+                ctx.server_name.clone_from(&server.name);
+                ctx.base_path = server.base_path().to_string();
+                ctx.is_mcp = true;
+
+                let peer = HttpPeer::new(server.host_port(), server.use_tls, server.host_port().to_string())
+                    .with_tcp_optimizations();
+
+                return Ok(Box::new(peer));
+            }
+            return Err(Error::explain(Custom("404"), "MCP server not found"));
+        }
+
+        // Fast path: direct server match (non-MCP servers)
+        if let Some(server) = current_conf.servers.iter().find(|s| s.name == slug && !s.mcp) {
             ctx.should_strip = server.strip_slug;
             ctx.use_tls = server.use_tls;
             ctx.server_name.clone_from(&server.name);
+            ctx.base_path = server.base_path().to_string();
+            ctx.is_mcp = false;
 
-            // Create peer with TCP optimizations
-            let peer = HttpPeer::new(&server.url, server.use_tls, server.url.clone())
+            // Create peer with TCP optimizations - use host:port only, not full URL
+            let peer = HttpPeer::new(server.host_port(), server.use_tls, server.host_port().to_string())
                 .with_tcp_optimizations();
 
             return Ok(Box::new(peer));
         }
 
-        // Session-based routing for /message or /http endpoints
-        if slug == "message" || slug == "http" {
+        // Session-based routing for /message or configured path endpoints
+        // Check if slug matches any server's configured path
+        let is_configured_path = current_conf.servers.iter().any(|s| s.path_slug() == slug);
+
+        if slug == "message" || is_configured_path {
             // Try Mcp-Session-Id header first (Streamable HTTP)
             let session_id = req_headers
                 .headers
@@ -186,8 +264,11 @@ impl ProxyHttp for DynamicMcpGateway {
                         ctx.should_strip = false;
                         ctx.use_tls = server.use_tls;
                         ctx.server_name.clone_from(server_name);
+                        ctx.base_path = server.base_path().to_string();
+                        ctx.is_mcp = server.mcp;
 
-                        let peer = HttpPeer::new(&server.url, server.use_tls, server.url.clone())
+                        // Create peer with TCP optimizations - use host:port only
+                        let peer = HttpPeer::new(server.host_port(), server.use_tls, server.host_port().to_string())
                             .with_tcp_optimizations();
 
                         return Ok(Box::new(peer));
@@ -216,11 +297,18 @@ impl ProxyHttp for DynamicMcpGateway {
         // Zero-copy path manipulation
         if ctx.should_strip {
             let current_path = upstream_request.uri.path();
-            // Only allocate if we actually need to strip
-            if current_path.contains('/') && current_path.len() > 1 {
-                let new_path = Self::strip_slug_from_path(current_path);
-                upstream_request.set_uri(new_path.parse().unwrap());
-            }
+            let new_path = if ctx.is_mcp {
+                // Strip /vs/<server_name> for MCP servers
+                Self::strip_vs_prefix(current_path, &ctx.server_name)
+            } else {
+                // Strip just the first segment for non-MCP servers
+                if current_path.contains('/') && current_path.len() > 1 {
+                    Self::strip_slug_from_path(current_path)
+                } else {
+                    current_path.to_string()
+                }
+            };
+            upstream_request.set_uri(new_path.parse().unwrap());
         }
 
         // Preserve headers for SSE/WebSocket using static string references

@@ -72,13 +72,13 @@ async def test_connection(name: str, base_url: str) -> bool:
 async def main():
     print("🔌 MCP SSE Client Test - Official Python SDK")
     print("   Using: mcp.client.sse.sse_client")
-    
-    # Test 1: Through gateway
+
+    # Test 1: Through gateway with /vs/<name> prefix (MCP mode)
     gateway_ok = await test_connection(
-        "Gateway (port 3000)",
-        "http://localhost:3000/time"
+        "Gateway /vs/time (port 3000)",
+        "http://localhost:3000/vs/time"
     )
-    
+
     # Test 2: Direct connection
     direct_ok = await test_connection(
         "Direct (port 8111)",

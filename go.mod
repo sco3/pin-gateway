@@ -1,4 +1,4 @@
-module pingora-proxy
+module go-benchmark
 
 go 1.25.6
 

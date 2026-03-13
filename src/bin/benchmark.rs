@@ -208,10 +208,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Small delay between benchmarks
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Test 2: Through gateway
+    // Test 2: Through gateway with /vs/<name> prefix (MCP mode)
     let gateway_stats = run_benchmark(BenchmarkConfig {
-        name: "Gateway (3000)".to_string(),
-        base_url: "http://localhost:3000/time".to_string(),
+        name: "Gateway /vs/time (3000)".to_string(),
+        base_url: "http://localhost:3000/vs/time".to_string(),
         concurrent_clients,
         requests_per_client,
     })
@@ -234,8 +234,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         1.0
     };
 
-    let overhead = gateway_latency / direct_latency;
-
     let direct_throughput = direct_stats.successful_requests as f64 / direct_stats.elapsed.as_secs_f64();
     let gateway_throughput = gateway_stats.successful_requests as f64 / gateway_stats.elapsed.as_secs_f64();
 
@@ -251,13 +249,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gateway_latency * 1000.0,
         gateway_stats.successful_requests * 100 / gateway_stats.total_requests.max(1)
     );
+
+    let latency_overhead_ms = (gateway_latency - direct_latency) * 1000.0;
+
     println!(
-        "\nGateway overhead: {:.2}x latency",
-        overhead
+        "\nGateway latency overhead: +{:.2}ms",
+        latency_overhead_ms
     );
 
     if gateway_stats.successful_requests == direct_stats.successful_requests {
-        println!("\n✅ Gateway achieves same throughput with {:.2}x overhead", overhead);
+        println!(
+            "\n✅ Gateway achieves same throughput with +{:.2}ms latency overhead",
+            latency_overhead_ms
+        );
     } else if gateway_stats.successful_requests >= direct_stats.successful_requests * 90 / 100 {
         println!("\n✅ Gateway performance is acceptable");
     } else {

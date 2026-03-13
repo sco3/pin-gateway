@@ -181,8 +181,8 @@ func main() {
 
 	// Test 2: Through gateway
 	gatewayStats := runBenchmark(BenchmarkConfig{
-		Name:              "Gateway (3000)",
-		BaseURL:           "http://localhost:3000/time",
+		Name:              "Gateway /vs/time (3000)",
+		BaseURL:           "http://localhost:3000/vs/time",
 		ConcurrentClients: concurrentClients,
 		RequestsPerClient: requestsPerClient,
 	})
@@ -201,8 +201,6 @@ func main() {
 	if gatewayStats.SuccessfulRequests > 0 {
 		gatewayLatency = float64(gatewayStats.TotalLatency) / float64(gatewayStats.SuccessfulRequests)
 	}
-
-	overhead := gatewayLatency / directLatency
 
 	directThroughput := float64(directStats.SuccessfulRequests) / directStats.Elapsed.Seconds()
 	gatewayThroughput := float64(gatewayStats.SuccessfulRequests) / gatewayStats.Elapsed.Seconds()
@@ -228,13 +226,18 @@ func main() {
 		gatewayLatency/float64(time.Millisecond),
 		gatewaySuccessRate,
 	)
+	latencyOverheadMs := gatewayLatency/directLatency*directLatency - directLatency
+
 	fmt.Printf(
-		"\nGateway overhead: %.2fx latency\n",
-		overhead,
+		"\nGateway latency overhead: +%.2fms\n",
+		latencyOverheadMs/float64(time.Millisecond),
 	)
 
 	if gatewayStats.SuccessfulRequests == directStats.SuccessfulRequests {
-		fmt.Printf("\n✅ Gateway achieves same throughput with %.2fx overhead\n", overhead)
+		fmt.Printf(
+			"\n✅ Gateway achieves same throughput with +%.2fms latency overhead\n",
+			latencyOverheadMs/float64(time.Millisecond),
+		)
 	} else if gatewayStats.SuccessfulRequests >= directStats.SuccessfulRequests*90/100 {
 		fmt.Println("\n✅ Gateway performance is acceptable")
 	} else {
