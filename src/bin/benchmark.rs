@@ -13,10 +13,38 @@ use rmcp::{
     transport::StreamableHttpClientTransport,
     ServiceExt,
 };
+use serde::Deserialize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
+
+#[derive(Deserialize, Debug, Clone)]
+struct McpServerConfig {
+    name: String,
+    url: String,
+    #[allow(dead_code)]
+    strip_slug: bool,
+    use_tls: bool,
+    #[allow(dead_code)]
+    mcp: bool,
+}
+
+impl McpServerConfig {
+    /// Extract base path from URL with leading slash (e.g., "127.0.0.1:8111/http" -> "/http")
+    fn base_path(&self) -> &str {
+        if let Some(pos) = self.url.find('/') {
+            &self.url[pos..]
+        } else {
+            "/"
+        }
+    }
+}
+
+#[derive(Deserialize, Debug)]
+struct McpConfig {
+    servers: Vec<McpServerConfig>,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "benchmark")]
@@ -29,6 +57,14 @@ struct Args {
     /// Number of requests per client
     #[arg(short = 'r', long = "requests-per-user", default_value = "10000")]
     requests_per_user: usize,
+
+    /// Server name from mcp-servers.toml (direct uses configured URL, gateway uses localhost:3000/vs/<name>)
+    #[arg(short = 's', long = "server", default_value = "fast")]
+    server: String,
+
+    /// Tool name to call for benchmark
+    #[arg(short = 't', long = "tool", default_value = "get_system_time")]
+    tool: String,
 }
 
 struct BenchmarkStats {
@@ -56,6 +92,7 @@ struct BenchmarkConfig {
     base_url: String,
     concurrent_clients: usize,
     requests_per_client: usize,
+    tool_name: String,
 }
 
 async fn run_benchmark(config: BenchmarkConfig) -> BenchmarkStats {
@@ -69,16 +106,18 @@ async fn run_benchmark(config: BenchmarkConfig) -> BenchmarkStats {
         config.requests_per_client,
         config.concurrent_clients * config.requests_per_client
     );
+    println!("   Tool: {}", config.tool_name);
 
     let start_time = Instant::now();
 
     for client_id in 0..config.concurrent_clients {
         let stats_clone = Arc::clone(&stats);
         let base_url = config.base_url.clone();
+        let tool_name = config.tool_name.clone();
 
         tasks.spawn(async move {
-            let client_stats = benchmark_client(client_id, base_url, config.requests_per_client).await;
-            
+            let client_stats = benchmark_client(client_id, base_url, config.requests_per_client, tool_name).await;
+
             let mut stats = stats_clone.lock().await;
             stats.total_requests += client_stats.total_requests;
             stats.successful_requests += client_stats.successful_requests;
@@ -139,6 +178,7 @@ async fn benchmark_client(
     client_id: usize,
     base_url: String,
     num_requests: usize,
+    tool_name: String,
 ) -> BenchmarkStats {
     let mut stats = BenchmarkStats::new();
     let http_url = format!("{}/http", base_url);
@@ -166,8 +206,8 @@ async fn benchmark_client(
     for i in 0..num_requests {
         let start = Instant::now();
 
-        // Call get_system_time tool
-        match client.call_tool(CallToolRequestParams::new("get_system_time")).await {
+        // Call specified tool
+        match client.call_tool(CallToolRequestParams::new(tool_name.clone())).await {
             Ok(result) => {
                 if !result.content.is_empty() {
                     stats.successful_requests += 1;
@@ -193,6 +233,63 @@ async fn benchmark_client(
     stats
 }
 
+/// Load server configuration from mcp-servers.toml
+fn load_server_config(server_name: &str) -> Result<McpServerConfig, Box<dyn std::error::Error>> {
+    let config_content = std::fs::read_to_string("mcp-servers.toml")
+        .map_err(|e| format!("Failed to read mcp-servers.toml: {}", e))?;
+    let config: McpConfig = toml::from_str(&config_content)
+        .map_err(|e| format!("Failed to parse mcp-servers.toml: {}", e))?;
+    
+    config.servers.into_iter()
+        .find(|s| s.name == server_name)
+        .ok_or_else(|| format!("Server '{}' not found in mcp-servers.toml", server_name).into())
+}
+
+/// Build base URL for direct server connection
+fn build_direct_url(server: &McpServerConfig) -> String {
+    let protocol = if server.use_tls { "https" } else { "http" };
+    format!("{}://{}", protocol, server.url)
+}
+
+/// Build base URL for gateway connection with /vs/<name> prefix
+fn build_gateway_url(server: &McpServerConfig) -> String {
+    let protocol = if server.use_tls { "https" } else { "http" };
+    // Gateway URL: http://localhost:3000/vs/<name><base_path>
+    // The base_path includes the leading slash and any additional path segments
+    format!("{}://localhost:3000/vs/{}{}", protocol, server.name, server.base_path())
+}
+
+/// Verify that the tool exists on the server, otherwise print available tools
+async fn verify_tool_exists(base_url: &str, tool_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let http_url = format!("{}/http", base_url);
+    
+    let transport = StreamableHttpClientTransport::from_uri(http_url.as_str());
+    let client_info = ClientInfo::new(
+        ClientCapabilities::default(),
+        Implementation::new("benchmark-client", "1.0.0"),
+    );
+
+    let client = client_info.serve(transport).await
+        .map_err(|e| format!("Failed to connect to server: {}", e))?;
+
+    // Try to list tools using the client's list_tools method
+    let tools_result = client.list_tools(None).await
+        .map_err(|e| format!("Failed to list tools: {}", e))?;
+
+    let tool_names: Vec<&str> = tools_result.tools.iter().map(|t| t.name.as_ref()).collect();
+    
+    if !tool_names.contains(&tool_name) {
+        eprintln!("\n❌ Tool '{}' not found on server", tool_name);
+        eprintln!("\nAvailable tools:");
+        for name in tool_names {
+            eprintln!("  - {}", name);
+        }
+        return Err(format!("Tool '{}' not found", tool_name).into());
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -200,19 +297,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🔌 MCP Streamable HTTP Benchmark");
     println!("   Comparing: Direct connection vs Gateway proxy");
     println!("   Transport: Streamable HTTP (SSE is deprecated)");
-    println!("   Method: Initialize once, call get_system_time repeatedly");
+    println!("   Method: Initialize once, call {} repeatedly", args.tool);
     println!("   Users: {}, Requests per user: {}", args.users, args.requests_per_user);
 
-    // Benchmark configuration
+    // Load server configuration from mcp-servers.toml
+    let server = load_server_config(&args.server)?;
+
+    println!("   Server: {} ({})", server.name, server.url);
+
     let concurrent_clients = args.users;
     let requests_per_client = args.requests_per_user;
 
-    // Test 1: Direct connection
+    // Test 1: Direct connection (using configured URL)
+    let direct_url = build_direct_url(&server);
+    println!("\n   Direct URL: {}", direct_url);
+    
+    // Verify tool exists on direct server
+    println!("   Verifying tool '{}' exists...", args.tool);
+    verify_tool_exists(&direct_url, &args.tool).await?;
+    println!("   ✅ Tool '{}' found", args.tool);
+    
     let direct_stats = run_benchmark(BenchmarkConfig {
-        name: "Direct (8111)".to_string(),
-        base_url: "http://localhost:8111".to_string(),
+        name: format!("Direct ({})", server.name),
+        base_url: direct_url,
         concurrent_clients,
         requests_per_client,
+        tool_name: args.tool.clone(),
     })
     .await;
 
@@ -220,11 +330,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Test 2: Through gateway with /vs/<name> prefix (MCP mode)
+    let gateway_url = build_gateway_url(&server);
+    println!("\n   Gateway URL: {}", gateway_url);
+    
+    // Verify tool exists on gateway
+    verify_tool_exists(&gateway_url, &args.tool).await?;
+    println!("   ✅ Tool '{}' found", args.tool);
+    
     let gateway_stats = run_benchmark(BenchmarkConfig {
-        name: "Gateway /vs/time (3000)".to_string(),
-        base_url: "http://localhost:3000/vs/time".to_string(),
+        name: format!("Gateway /vs/{}", server.name),
+        base_url: gateway_url,
         concurrent_clients,
         requests_per_client,
+        tool_name: args.tool.clone(),
     })
     .await;
 

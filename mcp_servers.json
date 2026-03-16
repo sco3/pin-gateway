@@ -1,5 +1,9 @@
 {
   "mcpServers": {
+    
+    "fast": {
+      "url": "http://localhost:9080/mcp"
+    },
     "time": {
       "url": "http://localhost:8111/http"
     },

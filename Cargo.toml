@@ -50,11 +50,9 @@ lto = "fat"
 codegen-units = 1
 # Abort on panic to reduce binary size and improve performance
 panic = "abort"
-# Strip debug symbols to reduce binary size
-strip = true
 
 # Profile for benchmarking with debug symbols (for perf/flamegraph)
 [profile.bench]
 inherits = "release"
-strip = false
-debug = true
+strip = true
+debug = false

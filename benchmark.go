@@ -11,6 +11,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -29,12 +30,6 @@ type BenchmarkStats struct {
 	TotalLatency       time.Duration
 	Elapsed            time.Duration
 }
-
-// Number of concurrent clients to simulate
-const concurrentClients = 10
-
-// Number of requests each client will send
-const requestsPerClient = 10000
 
 // BenchmarkConfig holds configuration for a benchmark run
 type BenchmarkConfig struct {
@@ -159,14 +154,28 @@ func benchmarkClient(clientID int, baseURL string, numRequests int) BenchmarkSta
 }
 
 func main() {
+	// CLI parameters
+	users := flag.Int("u", 125, "Number of concurrent clients")
+	usersAlt := flag.Int("users", 125, "Number of concurrent clients")
+	requestsPerUser := flag.Int("r", 10000, "Number of requests per client")
+	requestsPerUserAlt := flag.Int("requests-per-user", 10000, "Number of requests per client")
+	flag.Parse()
+
+	// Use provided values or defaults
+	concurrentClients := *users
+	if *usersAlt != 125 {
+		concurrentClients = *usersAlt
+	}
+	requestsPerClient := *requestsPerUser
+	if *requestsPerUserAlt != 10000 {
+		requestsPerClient = *requestsPerUserAlt
+	}
+
 	fmt.Println("🔌 MCP Streamable HTTP Benchmark")
 	fmt.Println("   Comparing: Direct connection vs Gateway proxy")
 	fmt.Println("   Transport: Streamable HTTP (SSE is deprecated)")
 	fmt.Println("   Method: Initialize once, call get_system_time repeatedly")
-
-	// Benchmark configuration
-	concurrentClients := concurrentClients
-	requestsPerClient := requestsPerClient
+	fmt.Printf("   Users: %d, Requests per user: %d\n", concurrentClients, requestsPerClient)
 
 	// Test 1: Direct connection
 	directStats := runBenchmark(BenchmarkConfig{

@@ -347,7 +347,7 @@ impl ProxyHttp for DynamicMcpGateway {
         let server_name_str = Self::get_server_name_str(ctx);
         let prefix_len = 7 + server_name_str.len(); // "data: /" + server_name
         let mut result = String::with_capacity(body_str.len() + prefix_len);
-        
+
         // Manual replacement to avoid format! allocation
         let mut search_start = 0;
         while let Some(pos) = body_str[search_start..].find("data: /") {
@@ -359,18 +359,39 @@ impl ProxyHttp for DynamicMcpGateway {
             search_start = absolute_pos + 7; // len("data: /")
         }
         result.push_str(&body_str[search_start..]);
-        
+
         *body = Some(Bytes::from(result));
         Ok(None)
     }
+}
+
+/// Print configuration and resulting gateway URLs
+fn print_config_info(config: &McpConfig) {
+    info!("=== Gateway Configuration ===");
+    for server in &config.servers {
+        if server.mcp {
+            info!(
+                "  Server: {} -> Gateway URL: http://localhost:3000/vs/{}{}",
+                server.url, server.name, server.base_path()
+            );
+        } else {
+            let slug = if server.strip_slug {
+                format!("http://localhost:3000/{} -> http://localhost:3000{}", server.name, server.base_path())
+            } else {
+                format!("http://localhost:3000/{} (full path preserved)", server.name)
+            };
+            info!("  Server: {} -> {}", server.url, slug);
+        }
+    }
+    info!("================================");
 }
 
 fn main() {
     // Initialize tracing subscriber
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("pin_gateway=debug".parse().unwrap()),
+            tracing_subscriber::EnvFilter::try_from_env("RUST_LOG")
+                .unwrap_or_else(|_| "info".parse().unwrap()),
         )
         .init();
 
@@ -382,14 +403,22 @@ fn main() {
     let config: McpConfig = toml::from_str(&raw_conf).unwrap();
     let shared_conf = Arc::new(ArcSwap::from_pointee(config));
 
+    // Print initial config and resulting URLs
+    print_config_info(&shared_conf.load());
+
     // File watcher thread
     let conf_for_watcher = Arc::clone(&shared_conf);
     std::thread::spawn(move || {
+        let mut last_content = String::new();
         loop {
             std::thread::sleep(Duration::from_secs(5));
             if let Ok(updated_raw) = std::fs::read_to_string("mcp-servers.toml") {
-                if let Ok(new_config) = toml::from_str::<McpConfig>(&updated_raw) {
-                    conf_for_watcher.store(Arc::new(new_config));
+                if updated_raw != last_content {
+                    if let Ok(new_config) = toml::from_str::<McpConfig>(&updated_raw) {
+                        last_content = updated_raw;
+                        conf_for_watcher.store(Arc::new(new_config));
+                        print_config_info(&conf_for_watcher.load());
+                    }
                 }
             }
         }
