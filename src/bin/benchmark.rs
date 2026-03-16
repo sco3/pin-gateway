@@ -1,12 +1,13 @@
 //! MCP Streamable HTTP Benchmark
 //! Compares requests per second: Direct vs Gateway
 //! Uses rmcp 1.2.0 with Streamable HTTP transport
-//! 
+//!
 //! Proper session management:
 //! - Initialize session once per client
 //! - Reuse session for all tool calls
 //! - Measures actual tool call throughput
 
+use clap::Parser;
 use rmcp::{
     model::{ClientCapabilities, ClientInfo, Implementation, CallToolRequestParams},
     transport::StreamableHttpClientTransport,
@@ -16,6 +17,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
+
+#[derive(Parser, Debug)]
+#[command(name = "benchmark")]
+#[command(about = "MCP Streamable HTTP Benchmark")]
+struct Args {
+    /// Number of concurrent clients
+    #[arg(short = 'u', long = "users", default_value = "125")]
+    users: usize,
+
+    /// Number of requests per client
+    #[arg(short = 'r', long = "requests-per-user", default_value = "10000")]
+    requests_per_user: usize,
+}
 
 struct BenchmarkStats {
     total_requests: usize,
@@ -36,12 +50,6 @@ impl BenchmarkStats {
         }
     }
 }
-
-/// Number of concurrent clients to simulate
-const CONCURRENT_CLIENTS: usize = 10;
-
-/// Number of requests each client will send
-const REQUESTS_PER_CLIENT: usize = 10000;
 
 struct BenchmarkConfig {
     name: String,
@@ -187,14 +195,17 @@ async fn benchmark_client(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+
     println!("🔌 MCP Streamable HTTP Benchmark");
     println!("   Comparing: Direct connection vs Gateway proxy");
     println!("   Transport: Streamable HTTP (SSE is deprecated)");
     println!("   Method: Initialize once, call get_system_time repeatedly");
+    println!("   Users: {}, Requests per user: {}", args.users, args.requests_per_user);
 
     // Benchmark configuration
-    let concurrent_clients = CONCURRENT_CLIENTS;
-    let requests_per_client = REQUESTS_PER_CLIENT;
+    let concurrent_clients = args.users;
+    let requests_per_client = args.requests_per_user;
 
     // Test 1: Direct connection
     let direct_stats = run_benchmark(BenchmarkConfig {

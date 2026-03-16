@@ -1707,6 +1707,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "bytes",
+ "clap",
  "http",
  "once_cell",
  "pingora",
