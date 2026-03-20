@@ -1,30 +1,18 @@
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::Bytes;
-use once_cell::sync::Lazy;
 use pingora::prelude::*;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tracing::info;
 
 // Static header names/values to avoid repeated string allocations
-static CORS_ORIGIN: &str = "Access-Control-Allow-Origin";
-static CORS_HEADERS: &str = "Access-Control-Allow-Headers";
-static CORS_METHODS: &str = "Access-Control-Allow-Methods";
-static STAR: &str = "*";
-static CONTENT_TYPE: &str = "Content-Type";
-static AUTHORIZATION: &str = "Authorization";
-static GET_POST_OPTIONS: &str = "GET, POST, OPTIONS";
 static CONNECTION: &str = "Connection";
 static ACCEPT: &str = "Accept";
 static CACHE_CONTROL: &str = "Cache-Control";
 static MCP_SESSION_ID: &str = "Mcp-Session-Id";
-
-// Regex for session ID extraction - compiled once at startup
-static SESSION_ID_REGEX: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"sessionId=([a-zA-Z0-9_-]+)").unwrap());
+static ACCEPT_ENCODING: &str = "Accept-Encoding";
 
 /// Extension trait for configuring HttpPeer with TCP optimizations
 trait HttpPeerExt {
@@ -52,15 +40,6 @@ struct McpServerConfig {
 }
 
 impl McpServerConfig {
-    /// Extract the path slug from the URL (e.g., "127.0.0.1:8111/http" -> "http")
-    fn path_slug(&self) -> &str {
-        if let Some(pos) = self.url.find('/') {
-            self.url[pos + 1..].trim_end_matches('/')
-        } else {
-            ""
-        }
-    }
-
     /// Extract host:port from URL (e.g., "127.0.0.1:8111/http" -> "127.0.0.1:8111")
     fn host_port(&self) -> &str {
         if let Some(pos) = self.url.find('/') {
@@ -85,23 +64,22 @@ struct McpConfig {
     servers: Vec<McpServerConfig>,
 }
 
-/// Minimal stack-allocated context - no heap allocations in hot path
+/// Minimal stack-allocated context - optimized for zero allocations in hot path
 pub struct McpCtx {
     should_strip: bool,
     use_tls: bool,
-    /// Small string optimization: server name is typically short
-    server_name: String,
-    /// Cached path slice to avoid re-parsing
-    path_len: usize,
-    /// Base path from config URL (e.g., "/http")
-    base_path: String,
+    /// Server name as bytes for faster comparisons
+    server_name: [u8; 32],
+    server_name_len: usize,
+    /// Base path as bytes for faster operations
+    base_path: [u8; 16],
+    base_path_len: usize,
     /// Is this an MCP server (requires /vs/<name>/ prefix)
     is_mcp: bool,
 }
 
 pub struct DynamicMcpGateway {
     conf: Arc<ArcSwap<McpConfig>>,
-    sessions: Arc<RwLock<rustc_hash::FxHashMap<String, String>>>,
 }
 
 impl DynamicMcpGateway {
@@ -112,6 +90,12 @@ impl DynamicMcpGateway {
         // Skip leading slash and find the next one
         let path = path.strip_prefix('/').unwrap_or(path);
         path.split('/').next().unwrap_or(path)
+    }
+
+    /// Get server name as string from byte array
+    #[inline]
+    fn get_server_name_str(ctx: &McpCtx) -> &str {
+        std::str::from_utf8(&ctx.server_name[..ctx.server_name_len]).unwrap_or("")
     }
 
     /// Strip slug from path using byte manipulation - no format! or collect
@@ -134,46 +118,43 @@ impl DynamicMcpGateway {
         "/".to_string()
     }
 
-    /// Strip /vs/<server_name> prefix from path for MCP servers
+    /// Fast path manipulation using pre-allocated buffers
+    /// Avoids format! allocations in hot path
     #[inline]
-    fn strip_vs_prefix(path: &str, server_name: &str) -> String {
-        // Path is like /vs/time/http, we want /http
-        let prefix = format!("/vs/{}", server_name);
-        if let Some(rest) = path.strip_prefix(&prefix) {
+    fn build_uri_fast(new_path: String, query: &str) -> String {
+        let mut result = String::with_capacity(new_path.len() + query.len());
+        result.push_str(&new_path);
+        result.push_str(query);
+        result
+    }
+
+    /// Strip /vs/<server_name> prefix using byte manipulation
+    #[inline]
+    fn strip_vs_prefix<'a>(path: &'a str, server_name: &str) -> (String, &'a str) {
+        // Path is like /vs/time/http?sessionId=xxx, we want /http?sessionId=xxx
+        // First separate path from query
+        let (path_only, query) = if let Some(pos) = path.find('?') {
+            (&path[..pos], &path[pos..])
+        } else {
+            (path, "")
+        };
+        
+        // Build prefix manually to avoid format!
+        let mut prefix = String::with_capacity(4 + server_name.len());
+        prefix.push_str("/vs/");
+        prefix.push_str(server_name);
+        
+        let new_path = if let Some(rest) = path_only.strip_prefix(&prefix) {
             if rest.is_empty() {
                 "/".to_string()
             } else {
                 rest.to_string()
             }
         } else {
-            path.to_string()
-        }
-    }
-
-    /// Extract session ID from query string without allocation
-    #[inline]
-    fn extract_session_from_query(query: &str) -> Option<&str> {
-        // Look for sessionId=xxx pattern
-        query
-            .split('&')
-            .find_map(|pair| {
-                pair.strip_prefix("sessionId=")
-                    .or_else(|| pair.strip_prefix("sessionid="))
-            })
-    }
-
-    /// Extract session ID from SSE response body efficiently
-    fn extract_session_from_sse_body(body: &[u8]) -> Option<String> {
-        let body_str = std::str::from_utf8(body).ok()?;
-
-        for line in body_str.lines() {
-            if line.starts_with("data:") && line.contains("sessionId=") {
-                if let Some(captures) = SESSION_ID_REGEX.captures(line) {
-                    return captures.get(1).map(|m| m.as_str().to_string());
-                }
-            }
-        }
-        None
+            path_only.to_string()
+        };
+        
+        (new_path, query)
     }
 }
 
@@ -185,37 +166,42 @@ impl ProxyHttp for DynamicMcpGateway {
         McpCtx {
             should_strip: false,
             use_tls: false,
-            server_name: String::new(),
-            path_len: 0,
-            base_path: String::new(),
+            server_name: [0; 32],
+            server_name_len: 0,
+            base_path: [0; 16],
+            base_path_len: 0,
             is_mcp: false,
         }
     }
 
-    async fn upstream_peer<'a>(
-        &'a self,
+    async fn upstream_peer(
+        & self,
         session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
         let req_headers = session.req_header();
         let path = req_headers.uri.path();
-        ctx.path_len = path.len();
 
-        // Zero-copy slug extraction
-        let slug = Self::extract_slug(path);
         let current_conf = self.conf.load();
 
         // Check for /vs/<server_name>/<path> pattern for MCP servers
         let path_segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        
+
         // Handle /vs/<server_name>/<rest> pattern
         if path_segments.len() >= 2 && path_segments[0] == "vs" {
             let server_name = path_segments[1];
             if let Some(server) = current_conf.servers.iter().find(|s| s.name == server_name && s.mcp) {
                 ctx.should_strip = true; // Strip /vs/<name>
                 ctx.use_tls = server.use_tls;
-                ctx.server_name.clone_from(&server.name);
-                ctx.base_path = server.base_path().to_string();
+                // Copy server name to fixed array
+                let name_bytes = server.name.as_bytes();
+                ctx.server_name_len = name_bytes.len().min(32);
+                ctx.server_name[..ctx.server_name_len].copy_from_slice(&name_bytes[..ctx.server_name_len]);
+                // Copy base path to fixed array
+                let base_path = server.base_path();
+                let base_path_bytes = base_path.as_bytes();
+                ctx.base_path_len = base_path_bytes.len().min(16);
+                ctx.base_path[..ctx.base_path_len].copy_from_slice(&base_path_bytes[..ctx.base_path_len]);
                 ctx.is_mcp = true;
 
                 let peer = HttpPeer::new(server.host_port(), server.use_tls, server.host_port().to_string())
@@ -227,55 +213,25 @@ impl ProxyHttp for DynamicMcpGateway {
         }
 
         // Fast path: direct server match (non-MCP servers)
+        let slug = Self::extract_slug(path);
         if let Some(server) = current_conf.servers.iter().find(|s| s.name == slug && !s.mcp) {
             ctx.should_strip = server.strip_slug;
             ctx.use_tls = server.use_tls;
-            ctx.server_name.clone_from(&server.name);
-            ctx.base_path = server.base_path().to_string();
+            // Copy server name to fixed array
+            let name_bytes = server.name.as_bytes();
+            ctx.server_name_len = name_bytes.len().min(32);
+            ctx.server_name[..ctx.server_name_len].copy_from_slice(&name_bytes[..ctx.server_name_len]);
+            // Copy base path to fixed array
+            let base_path = server.base_path();
+            let base_path_bytes = base_path.as_bytes();
+            ctx.base_path_len = base_path_bytes.len().min(16);
+            ctx.base_path[..ctx.base_path_len].copy_from_slice(&base_path_bytes[..ctx.base_path_len]);
             ctx.is_mcp = false;
 
-            // Create peer with TCP optimizations - use host:port only, not full URL
             let peer = HttpPeer::new(server.host_port(), server.use_tls, server.host_port().to_string())
                 .with_tcp_optimizations();
 
             return Ok(Box::new(peer));
-        }
-
-        // Session-based routing for /message or configured path endpoints
-        // Check if slug matches any server's configured path
-        let is_configured_path = current_conf.servers.iter().any(|s| s.path_slug() == slug);
-
-        if slug == "message" || is_configured_path {
-            // Try Mcp-Session-Id header first (Streamable HTTP)
-            let session_id = req_headers
-                .headers
-                .get(MCP_SESSION_ID)
-                .and_then(|h| h.to_str().ok())
-                .or_else(|| req_headers.uri.query().and_then(Self::extract_session_from_query));
-
-            if let Some(session_id) = session_id {
-                let sessions = self.sessions.read().await;
-                if let Some(server_name) = sessions.get(session_id) {
-                    if let Some(server) = current_conf
-                        .servers
-                        .iter()
-                        .find(|s| s.name.as_str() == server_name.as_str())
-                    {
-                        ctx.should_strip = false;
-                        ctx.use_tls = server.use_tls;
-                        ctx.server_name.clone_from(server_name);
-                        ctx.base_path = server.base_path().to_string();
-                        ctx.is_mcp = server.mcp;
-
-                        // Create peer with TCP optimizations - use host:port only
-                        let peer = HttpPeer::new(server.host_port(), server.use_tls, server.host_port().to_string())
-                            .with_tcp_optimizations();
-
-                        return Ok(Box::new(peer));
-                    }
-                }
-            }
-            return Err(Error::explain(Custom("404"), "Session not found"));
         }
 
         Err(Error::explain(Custom("404"), "Server not found"))
@@ -287,44 +243,52 @@ impl ProxyHttp for DynamicMcpGateway {
         upstream_request: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        let req_headers = session.req_header();
-
-        // Handle CORS preflight immediately - no upstream call needed
-        if req_headers.method == http::Method::OPTIONS {
-            return Ok(());
+        // Only remove Accept-Encoding for MCP requests to allow Gzip for other traffic
+        if ctx.is_mcp {
+            upstream_request.remove_header(ACCEPT_ENCODING);
         }
 
         // Zero-copy path manipulation
         if ctx.should_strip {
-            let current_path = upstream_request.uri.path();
-            let new_path = if ctx.is_mcp {
-                // Strip /vs/<server_name> for MCP servers
-                Self::strip_vs_prefix(current_path, &ctx.server_name)
+            // Get the full URI path+query (e.g., "/vs/time/message?sessionId=xxx")
+            let current_uri = upstream_request.uri.to_string();
+            let new_uri = if ctx.is_mcp {
+                // Strip /vs/<server_name> for MCP servers, preserving query string
+                let server_name_str = Self::get_server_name_str(ctx);
+                let (new_path, query) = Self::strip_vs_prefix(&current_uri, server_name_str);
+                Self::build_uri_fast(new_path, query)
             } else {
-                // Strip just the first segment for non-MCP servers
-                if current_path.contains('/') && current_path.len() > 1 {
-                    Self::strip_slug_from_path(current_path)
+                // For non-MCP servers, strip just the first segment
+                // Extract path only (before query)
+                let (path_only, query) = if let Some(pos) = current_uri.find('?') {
+                    (&current_uri[..pos], &current_uri[pos..])
                 } else {
-                    current_path.to_string()
-                }
+                    (current_uri.as_str(), "")
+                };
+                let new_path = if path_only.contains('/') && path_only.len() > 1 {
+                    Self::strip_slug_from_path(path_only)
+                } else {
+                    path_only.to_string()
+                };
+                Self::build_uri_fast(new_path, query)
             };
-            upstream_request.set_uri(new_path.parse().unwrap());
+            upstream_request.set_uri(new_uri.parse().unwrap());
         }
 
         // Preserve headers for SSE/WebSocket using static string references
-        let headers = &req_headers.headers;
+        let headers = &session.req_header().headers;
 
         if let Some(val) = headers.get(CONNECTION) {
-            let _ = upstream_request.insert_header(CONNECTION, val.clone());
+            let _ = upstream_request.insert_header(CONNECTION, val);
         }
         if let Some(val) = headers.get(ACCEPT) {
-            let _ = upstream_request.insert_header(ACCEPT, val.clone());
+            let _ = upstream_request.insert_header(ACCEPT, val);
         }
         if let Some(val) = headers.get(CACHE_CONTROL) {
-            let _ = upstream_request.insert_header(CACHE_CONTROL, val.clone());
+            let _ = upstream_request.insert_header(CACHE_CONTROL, val);
         }
         if let Some(val) = headers.get(MCP_SESSION_ID) {
-            let _ = upstream_request.insert_header(MCP_SESSION_ID, val.clone());
+            let _ = upstream_request.insert_header(MCP_SESSION_ID, val);
         }
 
         Ok(())
@@ -332,27 +296,13 @@ impl ProxyHttp for DynamicMcpGateway {
 
     async fn response_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        // Add CORS headers using static constants - no allocation
-        let _ = response.insert_header(CORS_ORIGIN, STAR);
-        let _ = response.insert_header(CORS_HEADERS, format!("{}, {}", CONTENT_TYPE, AUTHORIZATION));
-        let _ = response.insert_header(CORS_METHODS, GET_POST_OPTIONS);
-
-        // Capture Mcp-Session-Id for Streamable HTTP
-        if let Some(session_id_header) = response.headers.get(MCP_SESSION_ID) {
-            if let Ok(session_id) = session_id_header.to_str() {
-                let session_id = session_id.to_string();
-                let server_name = ctx.server_name.clone();
-                let sessions = Arc::clone(&self.sessions);
-
-                tokio::spawn(async move {
-                    let mut s = sessions.write().await;
-                    s.insert(session_id, server_name);
-                });
-            }
+        // Remove Content-Length only for GET requests on MCP servers (SSE streaming)
+        if session.req_header().method == http::Method::GET && ctx.is_mcp {
+            response.remove_header("Content-Length");
         }
 
         Ok(())
@@ -370,43 +320,105 @@ impl ProxyHttp for DynamicMcpGateway {
 
     fn response_body_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         body: &mut Option<Bytes>,
         _end_of_stream: bool,
         ctx: &mut Self::CTX,
     ) -> Result<Option<Duration>> {
-        // Extract sessionId from SSE endpoint response
-        if let Some(body_bytes) = body {
-            if let Some(session_id) = Self::extract_session_from_sse_body(body_bytes) {
-                let server_name = ctx.server_name.clone();
-                let sessions = Arc::clone(&self.sessions);
-
-                tokio::spawn(async move {
-                    let mut s = sessions.write().await;
-                    s.insert(session_id, server_name);
-                });
-            }
+        // Single method check - fast exit for non-GET requests
+        let method = &session.req_header().method;
+        if method != &http::Method::GET || !ctx.is_mcp {
+            return Ok(None);
         }
+
+        // Byte scan - check for "data: /" pattern using reference (no clone)
+        let Some(body_bytes) = body else { return Ok(None); };
+
+        if !body_bytes.windows(7).any(|w| w == b"data: /") {
+            return Ok(None);
+        }
+
+        let body_str = match std::str::from_utf8(body_bytes) {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
+
+        // Pre-allocate result buffer to avoid multiple allocations
+        let server_name_str = Self::get_server_name_str(ctx);
+        let prefix_len = 7 + server_name_str.len(); // "data: /" + server_name
+        let mut result = String::with_capacity(body_str.len() + prefix_len);
+
+        // Manual replacement to avoid format! allocation
+        let mut search_start = 0;
+        while let Some(pos) = body_str[search_start..].find("data: /") {
+            let absolute_pos = search_start + pos;
+            result.push_str(&body_str[..absolute_pos]);
+            result.push_str("data: /vs/");
+            result.push_str(server_name_str);
+            result.push_str("/");
+            search_start = absolute_pos + 7; // len("data: /")
+        }
+        result.push_str(&body_str[search_start..]);
+
+        *body = Some(Bytes::from(result));
         Ok(None)
     }
 }
 
+/// Print configuration and resulting gateway URLs
+fn print_config_info(config: &McpConfig) {
+    info!("=== Gateway Configuration ===");
+    for server in &config.servers {
+        if server.mcp {
+            info!(
+                "  Server: {} -> Gateway URL: http://localhost:3000/vs/{}{}",
+                server.url, server.name, server.base_path()
+            );
+        } else {
+            let slug = if server.strip_slug {
+                format!("http://localhost:3000/{} -> http://localhost:3000{}", server.name, server.base_path())
+            } else {
+                format!("http://localhost:3000/{} (full path preserved)", server.name)
+            };
+            info!("  Server: {} -> {}", server.url, slug);
+        }
+    }
+    info!("================================");
+}
+
 fn main() {
+    // Initialize tracing subscriber
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_env("RUST_LOG")
+                .unwrap_or_else(|_| "info".parse().unwrap()),
+        )
+        .init();
+
+    info!("Starting MCP Gateway with SSE body rewrite");
+
     // Load initial config
     let raw_conf =
         std::fs::read_to_string("mcp-servers.toml").expect("Missing config file");
     let config: McpConfig = toml::from_str(&raw_conf).unwrap();
     let shared_conf = Arc::new(ArcSwap::from_pointee(config));
-    let sessions = Arc::new(RwLock::new(rustc_hash::FxHashMap::default()));
+
+    // Print initial config and resulting URLs
+    print_config_info(&shared_conf.load());
 
     // File watcher thread
     let conf_for_watcher = Arc::clone(&shared_conf);
     std::thread::spawn(move || {
+        let mut last_content = String::new();
         loop {
             std::thread::sleep(Duration::from_secs(5));
             if let Ok(updated_raw) = std::fs::read_to_string("mcp-servers.toml") {
-                if let Ok(new_config) = toml::from_str::<McpConfig>(&updated_raw) {
-                    conf_for_watcher.store(Arc::new(new_config));
+                if updated_raw != last_content {
+                    if let Ok(new_config) = toml::from_str::<McpConfig>(&updated_raw) {
+                        last_content = updated_raw;
+                        conf_for_watcher.store(Arc::new(new_config));
+                        print_config_info(&conf_for_watcher.load());
+                    }
                 }
             }
         }
@@ -419,7 +431,6 @@ fn main() {
         &server.configuration,
         DynamicMcpGateway {
             conf: shared_conf,
-            sessions,
         },
     );
 

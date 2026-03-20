@@ -1,3 +1,6 @@
 /target
 .#*
+.idea
 go-benchmark
+benchmark-go
+
