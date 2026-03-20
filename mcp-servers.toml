@@ -6,14 +6,14 @@ use_tls = false
 mcp = true
 
 [[servers]]
-name = "timesse"
+name = "ssetime"
 url = "127.0.0.1:8111/sse"
 strip_slug = true
 use_tls = false
 mcp = true
 
 [[servers]]
-name = "fast-docker"
+name = "timedocker"
 url = "172.17.0.1:8880/mcp"
 strip_slug = true
 use_tls = false

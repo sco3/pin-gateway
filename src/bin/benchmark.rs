@@ -181,7 +181,12 @@ async fn benchmark_client(
     tool_name: String,
 ) -> BenchmarkStats {
     let mut stats = BenchmarkStats::new();
-    let http_url = format!("{}/http", base_url);
+    // Append /http only if not already present
+    let http_url = if base_url.ends_with("/http") {
+        base_url
+    } else {
+        format!("{}/http", base_url)
+    };
 
     // Step 1: Initialize session ONCE per client
     let transport = StreamableHttpClientTransport::from_uri(http_url.as_str());
@@ -261,7 +266,12 @@ fn build_gateway_url(server: &McpServerConfig) -> String {
 
 /// Verify that the tool exists on the server, otherwise print available tools
 async fn verify_tool_exists(base_url: &str, tool_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let http_url = format!("{}/http", base_url);
+    // Append /http only if not already present
+    let http_url = if base_url.ends_with("/http") {
+        base_url.to_string()
+    } else {
+        format!("{}/http", base_url)
+    };
     
     let transport = StreamableHttpClientTransport::from_uri(http_url.as_str());
     let client_info = ClientInfo::new(

@@ -14,13 +14,84 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
-	"os"
 	"sync"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// McpServerConfig holds configuration for a single MCP server
+type McpServerConfig struct {
+	Name       string `toml:"name"`
+	URL        string `toml:"url"`
+	StripSlug  bool   `toml:"strip_slug"`
+	UseTLS     bool   `toml:"use_tls"`
+	Mcp        bool   `toml:"mcp"`
+}
+
+// McpConfig holds the full MCP configuration
+type McpConfig struct {
+	Servers []McpServerConfig `toml:"servers"`
+}
+
+// loadServerConfig loads server configuration from mcp-servers.toml
+func loadServerConfig(serverName string) (*McpServerConfig, error) {
+	var config McpConfig
+	if _, err := toml.DecodeFile("mcp-servers.toml", &config); err != nil {
+		return nil, fmt.Errorf("failed to read mcp-servers.toml: %w", err)
+	}
+
+	for _, server := range config.Servers {
+		if server.Name == serverName {
+			return &server, nil
+		}
+	}
+	return nil, fmt.Errorf("server '%s' not found in mcp-servers.toml", serverName)
+}
+
+// buildDirectURL builds the direct connection URL from server config
+func buildDirectURL(server *McpServerConfig) string {
+	protocol := "http"
+	if server.UseTLS {
+		protocol = "https"
+	}
+	return fmt.Sprintf("%s://%s", protocol, server.URL)
+}
+
+// buildGatewayURL builds the gateway URL with /vs/<name> prefix
+func buildGatewayURL(server *McpServerConfig) string {
+	protocol := "http"
+	if server.UseTLS {
+		protocol = "https"
+	}
+	return fmt.Sprintf("%s://localhost:3000/vs/%s%s", protocol, server.Name, server.BasePath())
+}
+
+// BasePath extracts base path from URL (e.g., "127.0.0.1:8111/http" -> "/http")
+func (s *McpServerConfig) BasePath() string {
+	if pos := findSlash(s.URL); pos != -1 {
+		return s.URL[pos:]
+	}
+	return "/"
+}
+
+func findSlash(s string) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '/' {
+			return i
+		}
+	}
+	return -1
+}
+
+// hasSuffix checks if s ends with suffix (simple implementation to avoid strings package)
+func hasSuffix(s, suffix string) bool {
+	if len(suffix) > len(s) {
+		return false
+	}
+	return s[len(s)-len(suffix):] == suffix
+}
 
 // BenchmarkStats holds statistics for benchmark runs
 type BenchmarkStats struct {
@@ -37,6 +108,7 @@ type BenchmarkConfig struct {
 	BaseURL           string
 	ConcurrentClients int
 	RequestsPerClient int
+	ToolName          string
 }
 
 // runBenchmark runs the benchmark with the given configuration
@@ -60,7 +132,7 @@ func runBenchmark(config BenchmarkConfig) BenchmarkStats {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			clientStats := benchmarkClient(id, config.BaseURL, config.RequestsPerClient)
+			clientStats := benchmarkClient(id, config.BaseURL, config.RequestsPerClient, config.ToolName)
 
 			statsMu.Lock()
 			stats.TotalRequests += clientStats.TotalRequests
@@ -98,9 +170,15 @@ func runBenchmark(config BenchmarkConfig) BenchmarkStats {
 }
 
 // benchmarkClient runs benchmark for a single client
-func benchmarkClient(clientID int, baseURL string, numRequests int) BenchmarkStats {
+func benchmarkClient(clientID int, baseURL string, numRequests int, toolName string) BenchmarkStats {
 	var stats BenchmarkStats
-	httpURL := fmt.Sprintf("%s/http", baseURL)
+	// Append /http only if not already present
+	var httpURL string
+	if hasSuffix(baseURL, "/http") {
+		httpURL = baseURL
+	} else {
+		httpURL = fmt.Sprintf("%s/http", baseURL)
+	}
 
 	// Step 1: Initialize session ONCE per client
 	client := mcp.NewClient(&mcp.Implementation{
@@ -123,9 +201,9 @@ func benchmarkClient(clientID int, baseURL string, numRequests int) BenchmarkSta
 	for i := 0; i < numRequests; i++ {
 		start := time.Now()
 
-		// Call get_system_time tool
+		// Call specified tool
 		result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
-			Name: "get_system_time",
+			Name: toolName,
 		})
 
 		latency := time.Since(start)
@@ -156,44 +234,53 @@ func benchmarkClient(clientID int, baseURL string, numRequests int) BenchmarkSta
 func main() {
 	// CLI parameters
 	users := flag.Int("u", 125, "Number of concurrent clients")
-	usersAlt := flag.Int("users", 125, "Number of concurrent clients")
 	requestsPerUser := flag.Int("r", 10000, "Number of requests per client")
-	requestsPerUserAlt := flag.Int("requests-per-user", 10000, "Number of requests per client")
+	serverName := flag.String("s", "time", "Server name from mcp-servers.toml")
+	toolName := flag.String("t", "get_system_time", "Tool name to call for benchmark")
 	flag.Parse()
 
-	// Use provided values or defaults
 	concurrentClients := *users
-	if *usersAlt != 125 {
-		concurrentClients = *usersAlt
-	}
 	requestsPerClient := *requestsPerUser
-	if *requestsPerUserAlt != 10000 {
-		requestsPerClient = *requestsPerUserAlt
-	}
 
 	fmt.Println("🔌 MCP Streamable HTTP Benchmark")
 	fmt.Println("   Comparing: Direct connection vs Gateway proxy")
 	fmt.Println("   Transport: Streamable HTTP (SSE is deprecated)")
-	fmt.Println("   Method: Initialize once, call get_system_time repeatedly")
+	fmt.Println("   Method: Initialize once, call", *toolName, "repeatedly")
 	fmt.Printf("   Users: %d, Requests per user: %d\n", concurrentClients, requestsPerClient)
 
-	// Test 1: Direct connection
+	// Load server configuration from mcp-servers.toml
+	server, err := loadServerConfig(*serverName)
+	if err != nil {
+		log.Fatalf("Error loading server config: %v", err)
+	}
+
+	fmt.Printf("   Server: %s (%s)\n", server.Name, server.URL)
+
+	// Test 1: Direct connection (using configured URL)
+	directURL := buildDirectURL(server)
+	fmt.Printf("\n   Direct URL: %s\n", directURL)
+
 	directStats := runBenchmark(BenchmarkConfig{
-		Name:              "Direct (8111)",
-		BaseURL:           "http://localhost:8111",
+		Name:              fmt.Sprintf("Direct (%s)", server.Name),
+		BaseURL:           directURL,
 		ConcurrentClients: concurrentClients,
 		RequestsPerClient: requestsPerClient,
+		ToolName:          *toolName,
 	})
 
 	// Small delay between benchmarks
 	time.Sleep(2 * time.Second)
 
-	// Test 2: Through gateway
+	// Test 2: Through gateway with /vs/<name> prefix (MCP mode)
+	gatewayURL := buildGatewayURL(server)
+	fmt.Printf("\n   Gateway URL: %s\n", gatewayURL)
+
 	gatewayStats := runBenchmark(BenchmarkConfig{
-		Name:              "Gateway /vs/time (3000)",
-		BaseURL:           "http://localhost:3000/vs/time",
+		Name:              fmt.Sprintf("Gateway /vs/%s", server.Name),
+		BaseURL:           gatewayURL,
 		ConcurrentClients: concurrentClients,
 		RequestsPerClient: requestsPerClient,
+		ToolName:          *toolName,
 	})
 
 	// Summary
@@ -253,9 +340,3 @@ func main() {
 		fmt.Println("\n⚠️ Gateway has significant overhead")
 	}
 }
-
-// Check for HTTP client errors
-var _ = http.ErrAbortHandler
-
-// Check for OS functionality
-var _ = os.Args

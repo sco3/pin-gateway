@@ -2,4 +2,5 @@
 .#*
 .idea
 go-benchmark
+benchmark-go
 
