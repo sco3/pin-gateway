@@ -11,9 +11,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -93,6 +95,67 @@ func hasSuffix(s, suffix string) bool {
 	return s[len(s)-len(suffix):] == suffix
 }
 
+// containsErrorPattern checks if a response text contains common error patterns
+func containsErrorPattern(text string) bool {
+	textLower := toLower(text)
+	errorPatterns := []string{
+		"error:",
+		"error getting",
+		"error:",
+		"failed to",
+		"outside sandbox",
+		"permission denied",
+		"not found",
+		"invalid",
+	}
+	for _, pattern := range errorPatterns {
+		if contains(textLower, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func contains(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
+func toLower(s string) string {
+	var result []byte
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			c = c + ('a' - 'A')
+		}
+		result = append(result, c)
+	}
+	return string(result)
+}
+
+// parseJSON parses a JSON string into a map
+func parseJSON(data string, result *map[string]any) error {
+	// Simple JSON object parser
+	data = strings.TrimSpace(data)
+	if len(data) < 2 || data[0] != '{' || data[len(data)-1] != '}' {
+		return fmt.Errorf("invalid JSON object")
+	}
+
+	*result = make(map[string]any)
+	data = data[1 : len(data)-1] // Remove outer braces
+
+	if strings.TrimSpace(data) == "" {
+		return nil
+	}
+
+	// Use encoding/json for proper parsing
+	return json.Unmarshal([]byte(data), result)
+}
+
 // BenchmarkStats holds statistics for benchmark runs
 type BenchmarkStats struct {
 	TotalRequests      int
@@ -109,6 +172,7 @@ type BenchmarkConfig struct {
 	ConcurrentClients int
 	RequestsPerClient int
 	ToolName          string
+	ToolArguments     map[string]any
 }
 
 // runBenchmark runs the benchmark with the given configuration
@@ -132,7 +196,7 @@ func runBenchmark(config BenchmarkConfig) BenchmarkStats {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			clientStats := benchmarkClient(id, config.BaseURL, config.RequestsPerClient, config.ToolName)
+			clientStats := benchmarkClient(id, config.BaseURL, config.RequestsPerClient, config.ToolName, config.ToolArguments)
 
 			statsMu.Lock()
 			stats.TotalRequests += clientStats.TotalRequests
@@ -170,7 +234,7 @@ func runBenchmark(config BenchmarkConfig) BenchmarkStats {
 }
 
 // benchmarkClient runs benchmark for a single client
-func benchmarkClient(clientID int, baseURL string, numRequests int, toolName string) BenchmarkStats {
+func benchmarkClient(clientID int, baseURL string, numRequests int, toolName string, toolArgs map[string]any) BenchmarkStats {
 	var stats BenchmarkStats
 	// Append /http only if not already present
 	var httpURL string
@@ -201,9 +265,10 @@ func benchmarkClient(clientID int, baseURL string, numRequests int, toolName str
 	for i := 0; i < numRequests; i++ {
 		start := time.Now()
 
-		// Call specified tool
+		// Call specified tool with arguments
 		result, err := session.CallTool(context.Background(), &mcp.CallToolParams{
-			Name: toolName,
+			Name:      toolName,
+			Arguments: toolArgs,
 		})
 
 		latency := time.Since(start)
@@ -218,16 +283,26 @@ func benchmarkClient(clientID int, baseURL string, numRequests int, toolName str
 			continue
 		}
 
-		// Check if the tool call returned an error (IsError flag)
-		if result.IsError {
+		// Check if the tool call returned an error (IsError flag or error content)
+		isToolError := result.IsError
+		errorMsg := ""
+
+		// Also check if content contains error message (some servers don't set IsError)
+		if !isToolError && len(result.Content) > 0 {
+			if textContent, ok := result.Content[0].(*mcp.TextContent); ok {
+				errorMsg = textContent.Text
+				// Check for common error patterns in the response text
+				if containsErrorPattern(errorMsg) {
+					isToolError = true
+				}
+			}
+		}
+
+		if isToolError {
 			stats.FailedRequests++
 			if i == 0 {
-				// Extract error message from result content
-				errorMsg := "Unknown error"
-				if len(result.Content) > 0 {
-					if textContent, ok := result.Content[0].(*mcp.TextContent); ok {
-						errorMsg = textContent.Text
-					}
+				if errorMsg == "" {
+					errorMsg = "Tool call failed"
 				}
 				log.Printf("   Client %d tool error: %s", clientID, errorMsg)
 			}
@@ -253,8 +328,17 @@ func main() {
 	requestsPerUser := flag.Int("r", 10000, "Number of requests per client")
 	serverName := flag.String("s", "time", "Server name from mcp-servers.toml")
 	toolName := flag.String("t", "get_system_time", "Tool name to call for benchmark")
+	toolArgs := flag.String("a", "", "Tool arguments as JSON string")
 	directOnly := flag.Bool("d", false, "Direct bench only (skip gateway)")
 	flag.Parse()
+
+	// Parse tool arguments JSON
+	var argsMap map[string]any
+	if *toolArgs != "" {
+		if err := parseJSON(*toolArgs, &argsMap); err != nil {
+			log.Fatalf("Error parsing tool arguments: %v", err)
+		}
+	}
 
 	concurrentClients := *users
 	requestsPerClient := *requestsPerUser
@@ -283,6 +367,7 @@ func main() {
 		ConcurrentClients: concurrentClients,
 		RequestsPerClient: requestsPerClient,
 		ToolName:          *toolName,
+		ToolArguments:     argsMap,
 	})
 
 	// Exit early if direct-only mode
@@ -303,6 +388,7 @@ func main() {
 		ConcurrentClients: concurrentClients,
 		RequestsPerClient: requestsPerClient,
 		ToolName:          *toolName,
+		ToolArguments:     argsMap,
 	})
 
 	// Summary

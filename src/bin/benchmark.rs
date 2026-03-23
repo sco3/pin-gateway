@@ -235,7 +235,21 @@ async fn benchmark_client(
         // Call specified tool
         match client.call_tool(params).await {
             Ok(result) => {
-                if !result.content.is_empty() {
+                // Check if the tool call returned an error (is_error flag)
+                if result.is_error.unwrap_or(false) {
+                    stats.failed_requests += 1;
+                    if i == 0 {
+                        // Extract error message from content
+                        let error_msg = result.content.iter().find_map(|c| {
+                            if let rmcp::model::RawContent::Text(text) = &**c {
+                                Some(text.text.clone())
+                            } else {
+                                None
+                            }
+                        }).unwrap_or_else(|| "Tool call failed".to_string());
+                        eprintln!("   Client {} tool error: {}", client_id, error_msg);
+                    }
+                } else if !result.content.is_empty() {
                     stats.successful_requests += 1;
                 } else {
                     stats.failed_requests += 1;
