@@ -25,3 +25,18 @@ url = "127.0.0.1:9080/mcp"
 strip_slug = true
 use_tls = false
 mcp = true
+
+[[servers]]
+name = "gohello"
+url = "127.0.0.1:8080/mcp"
+strip_slug = true
+use_tls = false
+mcp = true
+
+[[servers]]
+name = "fs"
+url = "127.0.0.1:8084/mcp"
+strip_slug = true
+use_tls = false
+mcp = true
+

@@ -218,6 +218,22 @@ func benchmarkClient(clientID int, baseURL string, numRequests int, toolName str
 			continue
 		}
 
+		// Check if the tool call returned an error (IsError flag)
+		if result.IsError {
+			stats.FailedRequests++
+			if i == 0 {
+				// Extract error message from result content
+				errorMsg := "Unknown error"
+				if len(result.Content) > 0 {
+					if textContent, ok := result.Content[0].(*mcp.TextContent); ok {
+						errorMsg = textContent.Text
+					}
+				}
+				log.Printf("   Client %d tool error: %s", clientID, errorMsg)
+			}
+			continue
+		}
+
 		if len(result.Content) > 0 {
 			stats.SuccessfulRequests++
 		} else {
@@ -237,6 +253,7 @@ func main() {
 	requestsPerUser := flag.Int("r", 10000, "Number of requests per client")
 	serverName := flag.String("s", "time", "Server name from mcp-servers.toml")
 	toolName := flag.String("t", "get_system_time", "Tool name to call for benchmark")
+	directOnly := flag.Bool("d", false, "Direct bench only (skip gateway)")
 	flag.Parse()
 
 	concurrentClients := *users
@@ -267,6 +284,11 @@ func main() {
 		RequestsPerClient: requestsPerClient,
 		ToolName:          *toolName,
 	})
+
+	// Exit early if direct-only mode
+	if *directOnly {
+		return
+	}
 
 	// Small delay between benchmarks
 	time.Sleep(2 * time.Second)

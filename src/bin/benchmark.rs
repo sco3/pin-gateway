@@ -14,6 +14,7 @@ use rmcp::{
     ServiceExt,
 };
 use serde::Deserialize;
+use serde_json::Value;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -65,6 +66,14 @@ struct Args {
     /// Tool name to call for benchmark
     #[arg(short = 't', long = "tool", default_value = "get_system_time")]
     tool: String,
+
+    /// JSON arguments to pass to the tool (as a string, e.g., '{"key": "value"}')
+    #[arg(short = 'a', long = "arguments", default_value = "")]
+    arguments: String,
+
+    /// Direct bench only (skip gateway)
+    #[arg(short = 'd', long = "direct-only", default_value = "false")]
+    direct_only: bool,
 }
 
 struct BenchmarkStats {
@@ -93,6 +102,7 @@ struct BenchmarkConfig {
     concurrent_clients: usize,
     requests_per_client: usize,
     tool_name: String,
+    arguments: Option<serde_json::Map<String, Value>>,
 }
 
 async fn run_benchmark(config: BenchmarkConfig) -> BenchmarkStats {
@@ -107,6 +117,9 @@ async fn run_benchmark(config: BenchmarkConfig) -> BenchmarkStats {
         config.concurrent_clients * config.requests_per_client
     );
     println!("   Tool: {}", config.tool_name);
+    if let Some(ref args) = config.arguments {
+        println!("   Arguments: {}", serde_json::Value::Object(args.clone()));
+    }
 
     let start_time = Instant::now();
 
@@ -114,9 +127,10 @@ async fn run_benchmark(config: BenchmarkConfig) -> BenchmarkStats {
         let stats_clone = Arc::clone(&stats);
         let base_url = config.base_url.clone();
         let tool_name = config.tool_name.clone();
+        let arguments = config.arguments.clone();
 
         tasks.spawn(async move {
-            let client_stats = benchmark_client(client_id, base_url, config.requests_per_client, tool_name).await;
+            let client_stats = benchmark_client(client_id, base_url, config.requests_per_client, tool_name, arguments).await;
 
             let mut stats = stats_clone.lock().await;
             stats.total_requests += client_stats.total_requests;
@@ -179,6 +193,7 @@ async fn benchmark_client(
     base_url: String,
     num_requests: usize,
     tool_name: String,
+    arguments: Option<serde_json::Map<String, Value>>,
 ) -> BenchmarkStats {
     let mut stats = BenchmarkStats::new();
     // Append /http only if not already present
@@ -211,8 +226,14 @@ async fn benchmark_client(
     for i in 0..num_requests {
         let start = Instant::now();
 
+        // Build tool call with optional arguments
+        let mut params = CallToolRequestParams::new(tool_name.clone());
+        if let Some(ref args) = arguments {
+            params = params.with_arguments(args.clone());
+        }
+
         // Call specified tool
-        match client.call_tool(CallToolRequestParams::new(tool_name.clone())).await {
+        match client.call_tool(params).await {
             Ok(result) => {
                 if !result.content.is_empty() {
                     stats.successful_requests += 1;
@@ -315,6 +336,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("   Server: {} ({})", server.name, server.url);
 
+    // Parse JSON arguments if provided
+    let tool_arguments = if args.arguments.is_empty() {
+        None
+    } else {
+        // Parse as Value first, then extract as Object
+        let value: Value = serde_json::from_str(&args.arguments)
+            .map_err(|e| format!("Failed to parse JSON arguments: {}", e))?;
+        
+        // Ensure it's an object
+        match value {
+            Value::Object(obj) => Some(obj),
+            _ => return Err("JSON arguments must be an object (e.g., {\"key\": \"value\"})".into()),
+        }
+    };
+
     let concurrent_clients = args.users;
     let requests_per_client = args.requests_per_user;
 
@@ -333,8 +369,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         concurrent_clients,
         requests_per_client,
         tool_name: args.tool.clone(),
+        arguments: tool_arguments.clone(),
     })
     .await;
+
+    // Exit early if direct-only mode
+    if args.direct_only {
+        return Ok(());
+    }
 
     // Small delay between benchmarks
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -342,17 +384,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Test 2: Through gateway with /vs/<name> prefix (MCP mode)
     let gateway_url = build_gateway_url(&server);
     println!("\n   Gateway URL: {}", gateway_url);
-    
+
     // Verify tool exists on gateway
     verify_tool_exists(&gateway_url, &args.tool).await?;
     println!("   ✅ Tool '{}' found", args.tool);
-    
+
     let gateway_stats = run_benchmark(BenchmarkConfig {
         name: format!("Gateway /vs/{}", server.name),
         base_url: gateway_url,
         concurrent_clients,
         requests_per_client,
         tool_name: args.tool.clone(),
+        arguments: tool_arguments.clone(),
     })
     .await;
 
@@ -367,14 +410,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         1.0
     };
 
-    let gateway_latency = if gateway_stats.successful_requests > 0 {
-        gateway_stats.total_latency.as_secs_f64() / gateway_stats.successful_requests as f64
-    } else {
-        1.0
-    };
-
     let direct_throughput = direct_stats.successful_requests as f64 / direct_stats.elapsed.as_secs_f64();
-    let gateway_throughput = gateway_stats.successful_requests as f64 / gateway_stats.elapsed.as_secs_f64();
 
     println!(
         "Direct:  {:.2} req/s (avg {:.2}ms, {}% success)",
@@ -382,6 +418,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         direct_latency * 1000.0,
         direct_stats.successful_requests * 100 / direct_stats.total_requests.max(1)
     );
+
+    // Exit early if direct-only mode
+    if args.direct_only {
+        return Ok(());
+    }
+
+    let gateway_latency = if gateway_stats.successful_requests > 0 {
+        gateway_stats.total_latency.as_secs_f64() / gateway_stats.successful_requests as f64
+    } else {
+        1.0
+    };
+
+    let gateway_throughput = gateway_stats.successful_requests as f64 / gateway_stats.elapsed.as_secs_f64();
+
     println!(
         "Gateway: {:.2} req/s (avg {:.2}ms, {}% success)",
         gateway_throughput,
