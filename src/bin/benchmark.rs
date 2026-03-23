@@ -196,15 +196,8 @@ async fn benchmark_client(
     arguments: Option<serde_json::Map<String, Value>>,
 ) -> BenchmarkStats {
     let mut stats = BenchmarkStats::new();
-    // Append /http only if not already present
-    let http_url = if base_url.ends_with("/http") {
-        base_url
-    } else {
-        format!("{}/http", base_url)
-    };
-
-    // Step 1: Initialize session ONCE per client
-    let transport = StreamableHttpClientTransport::from_uri(http_url.as_str());
+    // Use the URL exactly as specified in the config
+    let transport = StreamableHttpClientTransport::from_uri(base_url.as_str());
     let client_info = ClientInfo::new(
         ClientCapabilities::default(),
         Implementation::new("benchmark-client", "1.0.0"),
@@ -301,14 +294,8 @@ fn build_gateway_url(server: &McpServerConfig) -> String {
 
 /// Verify that the tool exists on the server, otherwise print available tools
 async fn verify_tool_exists(base_url: &str, tool_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    // Append /http only if not already present
-    let http_url = if base_url.ends_with("/http") {
-        base_url.to_string()
-    } else {
-        format!("{}/http", base_url)
-    };
-    
-    let transport = StreamableHttpClientTransport::from_uri(http_url.as_str());
+    // Use the URL exactly as specified in the config
+    let transport = StreamableHttpClientTransport::from_uri(base_url);
     let client_info = ClientInfo::new(
         ClientCapabilities::default(),
         Implementation::new("benchmark-client", "1.0.0"),

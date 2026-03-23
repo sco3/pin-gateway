@@ -236,13 +236,8 @@ func runBenchmark(config BenchmarkConfig) BenchmarkStats {
 // benchmarkClient runs benchmark for a single client
 func benchmarkClient(clientID int, baseURL string, numRequests int, toolName string, toolArgs map[string]any) BenchmarkStats {
 	var stats BenchmarkStats
-	// Append /http only if not already present
-	var httpURL string
-	if hasSuffix(baseURL, "/http") {
-		httpURL = baseURL
-	} else {
-		httpURL = fmt.Sprintf("%s/http", baseURL)
-	}
+	// Use the URL exactly as specified in the config
+	httpURL := baseURL
 
 	// Step 1: Initialize session ONCE per client
 	client := mcp.NewClient(&mcp.Implementation{
